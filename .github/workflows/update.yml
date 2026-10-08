@@ -1,0 +1,60 @@
+name: update-threat-ledger
+
+on:
+  schedule:
+    - cron: "11 */3 * * *"   # every 3 hours; GitHub cron is best-effort and can lag
+  workflow_dispatch: {}
+
+concurrency:
+  group: update-threat-ledger
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Install browser for Crawl4AI
+        run: crawl4ai-setup
+
+      - name: Collect, extract, build
+        env:
+          # Optional. Without a key the structured feeds still run and the site still updates.
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL || 'https://openrouter.ai/api/v1' }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || 'google/gemini-2.5-flash' }}
+        run: python main.py all
+
+      - name: Save data back to the repo
+        run: |
+          git config user.name "intel-bot"
+          git config user.email "intel-bot@users.noreply.github.com"
+          git add intel.db digest_*.md site/index.html
+          git diff --cached --quiet || (git commit -m "data update [skip ci]" && git push)
+
+      - name: Stage site
+        run: mkdir public && cp site/index.html public/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
