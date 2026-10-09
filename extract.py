@@ -176,20 +176,15 @@ def _run_full(client, r, text):
                  inc.supporting_snippet]
 
 
-def _run_pointer(client, r, text):
-    tl = r["title"].lower().strip(" .")
-    sents = [x for x in split_sentences(text) if x.lower().strip(" .") != tl]  # a headline is not evidence
-    if not sents:
-        # RSS-only articles can be a single short line: classify from the title alone
-        sents = [r["title"]]
+def ask_pointer(client, title, sents, model=None):
+    """Ask the model to label numbered sentences. Retries once on malformed JSON."""
     numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(sents, 1))
-    p = None
     for attempt in range(2):  # small models sometimes break the JSON; retry once
         resp = client.chat.completions.create(
-            model=OPENROUTER_MODEL, temperature=0, response_format={"type": "json_object"},
+            model=model or OPENROUTER_MODEL, temperature=0, response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": SYSTEM_POINTER},
-                {"role": "user", "content": f"Title: {r['title']}\n\n{numbered}"
+                {"role": "user", "content": f"Title: {title}\n\n{numbered}"
                  + ("\n\nReply with the JSON object only." if attempt else "")},
             ],
         )
@@ -198,11 +193,30 @@ def _run_pointer(client, r, text):
             raise RuntimeError("empty model reply")  # transient: leave the article for the next run
         m = re.search(r"\{.*\}", raw, re.S)
         try:
-            p = Pointer.model_validate_json(m.group(0) if m else raw)
-            break
+            return Pointer.model_validate_json(m.group(0) if m else raw)
         except ValidationError:
             if attempt:
                 raise
+
+
+def gate(p, title, sents):
+    """Apply the keyword checks that guard against a weak model. Returns the final decisions."""
+    blob = f"{title} {' '.join(sents)}"
+    hits = sorted({m.group(0).lower() for m in INDIA_RE.finditer(blob)})
+    fix_idx = [i for i in p.fix_sentences if 1 <= i <= len(sents) and FIX_RE.search(sents[i - 1])]
+    impact_idx = [i for i in p.impact_sentences if i not in p.fix_sentences
+                  and 1 <= i <= len(sents) and IMPACT_RE.search(sents[i - 1])]
+    return {"inc": bool(p.is_incident and INCIDENT_RE.search(blob)), "india": bool(p.india_relevant and hits),
+            "india_hits": hits, "fix": fix_idx[:3], "impact": impact_idx[:3]}
+
+
+def _run_pointer(client, r, text):
+    tl = r["title"].lower().strip(" .")
+    sents = [x for x in split_sentences(text) if x.lower().strip(" .") != tl]  # a headline is not evidence
+    if not sents:
+        # RSS-only articles can be a single short line: classify from the title alone
+        sents = [r["title"]]
+    p = ask_pointer(client, r["title"], sents)
     blob = f"{r['title']} {' '.join(sents)}"
     hits = sorted({m.group(0).lower() for m in INDIA_RE.finditer(blob)})
     india = bool(p.india_relevant and hits)

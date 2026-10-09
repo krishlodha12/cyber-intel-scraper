@@ -1,0 +1,51 @@
+name: evaluate-extractor
+
+# Manual only. Scores each free local model against the hand-labeled gold set in eval/.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ["qwen2.5:3b", "qwen2.5:7b"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install openai pydantic python-dotenv
+
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama
+          key: ollama-eval-${{ matrix.model }}-v1
+
+      - name: Start a free local model
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve > ollama.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:11434/api/tags >/dev/null && break; sleep 2; done
+          ollama pull ${{ matrix.model }}
+
+      - name: Evaluate
+        env:
+          LLM_BASE_URL: http://localhost:11434/v1
+          LLM_API_KEY: ollama
+          EXTRACT_MODE: pointer
+        run: python eval/evaluate.py --model "${{ matrix.model }}" --out "results.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-job-${{ strategy.job-index }}
+          path: results.json
