@@ -44,16 +44,16 @@ class Incident(BaseModel):
 
 
 FIX_RE = re.compile(
-    r"(patch|patched|update|updated|upgrade|upgrading|mitigat\w*|disable|disabled|apply|applying|recommend\w*|advis\w*|"
+    r"\b(patch|patched|update|updated|upgrade|upgrading|mitigat\w*|disable|disabled|apply|applying|recommend\w*|advis\w*|"
     r"should|urge\w*|block\w*|rotate|reset|install\w*|workaround|fix|fixed|fixes|remediat\w*|secure|enable|restrict\w*|"
-    r"revoke|isolate)", re.I)
+    r"revoke|isolate)\b", re.I)
 IMPACT_RE = re.compile(
-    r"(stole\w*|stolen|exposed|leak\w*|records?|million|billion|thousands?|affected|victims?|encrypt\w*|ransom\w*|"
+    r"\b(stole\w*|stolen|exposed|leak\w*|records?|million|billion|thousands?|affected|victims?|encrypt\w*|ransom\w*|"
     r"downtime|outage|loss|losses|lost|compromis\w*|breach\w*|exfiltrat\w*|hijack\w*|disrupt\w*|damage|fined?|"
-    r"accounts?|customers?|users?|servers?|devices?|organi[sz]ations?)", re.I)
+    r"accounts?|customers?|users?|servers?|devices?|organi[sz]ations?)\b", re.I)
 INCIDENT_RE = re.compile(
-    r"(attack\w*|breach\w*|hack\w*|ransomware|malware|vulnerab\w*|exploit\w*|zero-day|phishing|scam|fraud|leak\w*|"
-    r"stolen|backdoor|botnet|cve-\d{4}|patch\w*|compromis\w*|extortion|espionage|stealer|spyware|worm|ddos|advisory)",
+    r"\b(attack\w*|breach\w*|hack\w*|ransomware|malware|vulnerab\w*|exploit\w*|zero-day|phishing|scam|fraud|leak\w*|"
+    r"stolen|backdoor|botnet|cve-\d{4}|patch\w*|compromis\w*|extortion|espionage|stealer|spyware|worm|ddos|advisory)\b",
     re.I)
 
 
