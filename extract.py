@@ -10,7 +10,7 @@ import os
 import re
 from typing import Optional
 from openai import OpenAI
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from config import LLM_BASE_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL, PER_SOURCE_PER_RUN
 from db import connect
 
@@ -43,8 +43,23 @@ class Incident(BaseModel):
     supporting_snippet: str = Field(default="", description="One verbatim sentence from the article supporting the main claim, for human verification.")
 
 
+FIX_RE = re.compile(
+    r"(patch|patched|update|updated|upgrade|upgrading|mitigat\w*|disable|disabled|apply|applying|recommend\w*|advis\w*|"
+    r"should|urge\w*|block\w*|rotate|reset|install\w*|workaround|fix|fixed|fixes|remediat\w*|secure|enable|restrict\w*|"
+    r"revoke|isolate)", re.I)
+IMPACT_RE = re.compile(
+    r"(stole\w*|stolen|exposed|leak\w*|records?|million|billion|thousands?|affected|victims?|encrypt\w*|ransom\w*|"
+    r"downtime|outage|loss|losses|lost|compromis\w*|breach\w*|exfiltrat\w*|hijack\w*|disrupt\w*|damage|fined?|"
+    r"accounts?|customers?|users?|servers?|devices?|organi[sz]ations?)", re.I)
+INCIDENT_RE = re.compile(
+    r"(attack\w*|breach\w*|hack\w*|ransomware|malware|vulnerab\w*|exploit\w*|zero-day|phishing|scam|fraud|leak\w*|"
+    r"stolen|backdoor|botnet|cve-\d{4}|patch\w*|compromis\w*|extortion|espionage|stealer|spyware|worm|ddos|advisory)",
+    re.I)
+
+
 class Pointer(BaseModel):
-    is_incident: bool
+    """Tolerant of sloppy small-model output: wrong types are coerced or dropped instead of failing the article."""
+    is_incident: bool = False
     india_relevant: bool = False
     attack_type: str = ""
     victim_org: Optional[str] = None
@@ -52,6 +67,41 @@ class Pointer(BaseModel):
     victim_sector: Optional[str] = None
     fix_sentences: list[int] = Field(default_factory=list)
     impact_sentences: list[int] = Field(default_factory=list)
+
+    @field_validator("is_incident", "india_relevant", mode="before")
+    @classmethod
+    def _bool(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "yes", "1")
+        return bool(v)
+
+    @field_validator("attack_type", "victim_org", "victim_country", "victim_sector", mode="before")
+    @classmethod
+    def _text(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, (list, tuple)):
+            v = ", ".join(str(x) for x in v if x)
+        v = str(v).strip()
+        return v if v and v.lower() not in ("null", "none", "n/a", "unknown") else None
+
+    @field_validator("attack_type", mode="after")
+    @classmethod
+    def _at(cls, v):
+        return v or ""
+
+    @field_validator("fix_sentences", "impact_sentences", mode="before")
+    @classmethod
+    def _ints(cls, v):
+        if isinstance(v, (int, str)):
+            v = [v]
+        out = []
+        for x in v or []:
+            try:
+                out.append(int(str(x).strip().rstrip(".")))
+            except ValueError:
+                pass
+        return out
 
 
 SYSTEM = (
@@ -96,10 +146,11 @@ def split_sentences(text: str, max_sentences: int = 40, max_chars: int = 5000) -
     return out
 
 
-def _pick(sents: list[str], idx: list[int], keep: int = 3) -> str:
+def _pick(sents: list[str], idx: list[int], must: "re.Pattern", keep: int = 3) -> str:
+    """Copy the chosen sentences verbatim, but only those that pass a keyword check (guards against a weak model)."""
     seen, picked = set(), []
     for i in idx:
-        if isinstance(i, int) and 1 <= i <= len(sents) and i not in seen:
+        if 1 <= i <= len(sents) and i not in seen and must.search(sents[i - 1]):
             seen.add(i)
             picked.append(sents[i - 1])
         if len(picked) >= keep:
@@ -152,10 +203,11 @@ def _run_pointer(client, r, text):
     hits = sorted({m.group(0).lower() for m in INDIA_RE.finditer(blob)})
     india = bool(p.india_relevant and hits)
     reason = f"Text mentions: {', '.join(hits[:4])}." if india else ""
-    impact = _pick(sents, p.impact_sentences)
-    row = [p.is_incident, india, reason, r["title"], None, p.attack_type.strip().lower()[:60], p.victim_org,
+    impact = _pick(sents, [i for i in p.impact_sentences if i not in p.fix_sentences], IMPACT_RE)
+    is_inc = bool(p.is_incident and INCIDENT_RE.search(blob))  # an incident must read like one
+    row = [is_inc, india, reason, r["title"], None, p.attack_type.strip().lower()[:60], p.victim_org,
            p.victim_country, p.victim_sector, None, False, ",".join(sorted({c.upper() for c in CVE_RE.findall(blob)})),
-           _pick(sents, p.fix_sentences), impact, impact.split(". ")[0] if impact else sents[0]]
+           _pick(sents, p.fix_sentences, FIX_RE), impact, impact.split(". ")[0] if impact else sents[0]]
     return p, row
 
 
