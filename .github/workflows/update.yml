@@ -2,7 +2,7 @@ name: update-threat-ledger
 
 on:
   schedule:
-    - cron: "11 */3 * * *"   # every 3 hours; GitHub cron is best-effort and can lag
+    - cron: "11 * * * *"   # checked hourly because GitHub drops/delays scheduled runs; the gate below keeps real runs to ~every 3 hours
   workflow_dispatch: {}
 
 concurrency:
@@ -13,9 +13,30 @@ permissions:
   contents: write
   pages: write
   id-token: write
+  actions: read
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          last=$(gh run list -R "${{ github.repository }}" -w update-threat-ledger.yml --status success -L 1 --json createdAt -q '.[0].createdAt')
+          if [ -z "$last" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          age=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 60 ))
+          echo "last successful update: $last ($age min ago)"
+          if [ "$age" -ge 150 ]; then echo "run=true" >> "$GITHUB_OUTPUT"; else echo "run=false" >> "$GITHUB_OUTPUT"; fi
+
   update:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 50
     environment:
