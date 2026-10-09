@@ -61,7 +61,7 @@ class Pointer(BaseModel):
     """Tolerant of sloppy small-model output: wrong types are coerced or dropped instead of failing the article."""
     is_incident: bool = False
     india_relevant: bool = False
-    attack_type: str = ""
+    attack_type: Optional[str] = ""
     victim_org: Optional[str] = None
     victim_country: Optional[str] = None
     victim_sector: Optional[str] = None
@@ -209,7 +209,7 @@ def _run_pointer(client, r, text):
     reason = f"Text mentions: {', '.join(hits[:4])}." if india else ""
     impact = _pick(sents, [i for i in p.impact_sentences if i not in p.fix_sentences], IMPACT_RE)
     is_inc = bool(p.is_incident and INCIDENT_RE.search(blob))  # an incident must read like one
-    row = [is_inc, india, reason, r["title"], None, p.attack_type.strip().lower()[:60], p.victim_org,
+    row = [is_inc, india, reason, r["title"], None, (p.attack_type or "").strip().lower()[:60], p.victim_org,
            p.victim_country, p.victim_sector, None, False, ",".join(sorted({c.upper() for c in CVE_RE.findall(blob)})),
            _pick(sents, p.fix_sentences, FIX_RE), impact, impact.split(". ")[0] if impact else sents[0]]
     return p, row
