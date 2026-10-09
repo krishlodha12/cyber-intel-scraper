@@ -131,6 +131,9 @@ def _client() -> OpenAI:
     return OpenAI(base_url=LLM_BASE_URL, api_key=OPENROUTER_API_KEY, timeout=180)
 
 
+JUNK_RE = re.compile(r"(\]\(|https?://|\bjoin the\b|\bsubscribe\b|\bregister (now|today|for)\b|\bwebinar\b|\bsign up\b|\bread more\b|\bfollow us\b|\bnewsletter\b|\bsponsored\b|\bcookie)", re.I)
+
+
 def split_sentences(text: str, max_sentences: int = 40, max_chars: int = 5000) -> list[str]:
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text or "")           # images
     text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)               # links -> text
@@ -138,7 +141,7 @@ def split_sentences(text: str, max_sentences: int = 40, max_chars: int = 5000) -
     out, used = [], 0
     for chunk in re.split(r"\n{2,}", text):
         for s in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", re.sub(r"\s+", " ", chunk).strip()):
-            if 20 <= len(s) <= 400:
+            if 20 <= len(s) <= 400 and not JUNK_RE.search(s):
                 out.append(s)
                 used += len(s)
                 if len(out) >= max_sentences or used >= max_chars:
@@ -174,7 +177,8 @@ def _run_full(client, r, text):
 
 
 def _run_pointer(client, r, text):
-    sents = split_sentences(text)
+    tl = r["title"].lower().strip(" .")
+    sents = [x for x in split_sentences(text) if x.lower().strip(" .") != tl]  # a headline is not evidence
     if not sents:
         # RSS-only articles can be a single short line: classify from the title alone
         sents = [r["title"]]
