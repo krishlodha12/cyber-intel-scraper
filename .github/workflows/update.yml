@@ -28,7 +28,7 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           if [ "$EVENT" != "schedule" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          last=$(gh run list -R "${{ github.repository }}" -w update-threat-ledger.yml --status success -L 1 --json createdAt -q '.[0].createdAt')
+          last=$(gh run list -R "${{ github.repository }}" -w update.yml --status success -L 1 --json createdAt -q '.[0].createdAt')
           if [ -z "$last" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
           age=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 60 ))
           echo "last successful update: $last ($age min ago)"
