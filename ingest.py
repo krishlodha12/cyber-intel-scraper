@@ -1,5 +1,6 @@
 """Step 1: pull article URLs from RSS feeds, then fetch full text with Crawl4AI."""
 import asyncio
+import os
 import re
 import feedparser
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
@@ -34,7 +35,7 @@ def ingest_feeds() -> int:
     return new
 
 
-async def fetch_articles(limit: int = 200) -> None:
+async def fetch_articles(limit: int = int(os.getenv("FETCH_LIMIT", "200"))) -> None:
     conn = connect()
     rows = conn.execute(
         """SELECT id,url FROM (

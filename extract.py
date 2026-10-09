@@ -1,10 +1,28 @@
-"""Step 2: structured extraction + India filter via OpenRouter."""
+"""Step 2: structured extraction + India filter.
+
+Two modes (EXTRACT_MODE):
+  full     the model writes every field (needs a strong model, e.g. via OpenRouter/OmniRoute)
+  pointer  the model only PICKS sentence numbers and short labels; fix/impact text is copied
+           verbatim from the article. Small free models can do this, and cannot invent facts.
+"""
 import json
+import os
+import re
 from typing import Optional
 from openai import OpenAI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from config import LLM_BASE_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL, PER_SOURCE_PER_RUN
 from db import connect
+
+EXTRACT_MODE = os.getenv("EXTRACT_MODE", "full")
+EXTRACT_LIMIT = int(os.getenv("EXTRACT_LIMIT", "200"))
+CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.I)
+# India evidence must literally appear in the text; the model alone cannot mark something India-relevant.
+INDIA_RE = re.compile(
+    r"\b(india|indian|upi|aadhaar|aadhar|rbi|cert-in|dpdp|npci|sebi|meity|mumbai|delhi|bengaluru|bangalore|"
+    r"hyderabad|chennai|kolkata|pune|gurugram|noida|crore|lakh)\b|₹",
+    re.I,
+)
 
 
 class Incident(BaseModel):
@@ -25,6 +43,17 @@ class Incident(BaseModel):
     supporting_snippet: str = Field(default="", description="One verbatim sentence from the article supporting the main claim, for human verification.")
 
 
+class Pointer(BaseModel):
+    is_incident: bool
+    india_relevant: bool = False
+    attack_type: str = ""
+    victim_org: Optional[str] = None
+    victim_country: Optional[str] = None
+    victim_sector: Optional[str] = None
+    fix_sentences: list[int] = Field(default_factory=list)
+    impact_sentences: list[int] = Field(default_factory=list)
+
+
 SYSTEM = (
     "You extract structured cybersecurity intelligence from news articles. "
     "Use ONLY facts stated in the article; use null/empty when unknown. Never infer hosting location. "
@@ -32,16 +61,108 @@ SYSTEM = (
     + json.dumps(Incident.model_json_schema())
 )
 
+SYSTEM_POINTER = (
+    "You label cybersecurity news. The article is split into numbered sentences. Reply with ONE JSON object:\n"
+    '{"is_incident": bool, "india_relevant": bool, "attack_type": str, "victim_org": str|null, '
+    '"victim_country": str|null, "victim_sector": str|null, "fix_sentences": [int], "impact_sentences": [int]}\n'
+    "is_incident: true only if it reports a concrete attack, breach, vulnerability, scam campaign or security advisory "
+    "(false for opinion, ads, product news, policy talk).\n"
+    "india_relevant: true only if the victims, attackers, regulators or users involved are in India.\n"
+    "attack_type: 1-3 words such as ransomware, data breach, phishing, zero-day, malware, scam.\n"
+    "fix_sentences: numbers of sentences that tell readers what to do or what was patched (empty list if none).\n"
+    "impact_sentences: numbers of sentences that state the damage (data stolen, downtime, money lost).\n"
+    "Output sentence NUMBERS only, never text. Use null or [] when unsure."
+)
+
 
 def _client() -> OpenAI:
     if not OPENROUTER_API_KEY:
         raise SystemExit("Set LLM_API_KEY (or OPENROUTER_API_KEY) in .env.")
-    return OpenAI(base_url=LLM_BASE_URL, api_key=OPENROUTER_API_KEY)
+    return OpenAI(base_url=LLM_BASE_URL, api_key=OPENROUTER_API_KEY, timeout=180)
 
 
-def extract_pending(limit: int = 200) -> None:
+def split_sentences(text: str, max_sentences: int = 40, max_chars: int = 5000) -> list[str]:
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text or "")           # images
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)               # links -> text
+    text = re.sub(r"^[#>*\-\s]+", "", text, flags=re.M)               # markdown markers
+    out, used = [], 0
+    for chunk in re.split(r"\n{2,}", text):
+        for s in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])", re.sub(r"\s+", " ", chunk).strip()):
+            if 20 <= len(s) <= 400:
+                out.append(s)
+                used += len(s)
+                if len(out) >= max_sentences or used >= max_chars:
+                    return out
+    return out
+
+
+def _pick(sents: list[str], idx: list[int], keep: int = 3) -> str:
+    seen, picked = set(), []
+    for i in idx:
+        if isinstance(i, int) and 1 <= i <= len(sents) and i not in seen:
+            seen.add(i)
+            picked.append(sents[i - 1])
+        if len(picked) >= keep:
+            break
+    return " ".join(picked)
+
+
+def _run_full(client, r, text):
+    resp = client.chat.completions.create(
+        model=OPENROUTER_MODEL, temperature=0, response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": f"Source: {r['source']}\nTitle: {r['title']}\nURL: {r['url']}\n\n{text}"},
+        ],
+    )
+    inc = Incident.model_validate_json(resp.choices[0].message.content)
+    return inc, [inc.is_incident, inc.india_relevant, inc.india_reason, inc.incident_title, inc.incident_date,
+                 inc.attack_type, inc.victim_org, inc.victim_country, inc.victim_sector, inc.data_hosting_location,
+                 inc.foreign_hosted_india_company, ",".join(inc.cves), inc.fix_mitigation, inc.consequences,
+                 inc.supporting_snippet]
+
+
+def _run_pointer(client, r, text):
+    sents = split_sentences(text)
+    if not sents:
+        # RSS-only articles can be a single short line: classify from the title alone
+        sents = [r["title"]]
+    numbered = "\n".join(f"{i}. {s}" for i, s in enumerate(sents, 1))
+    p = None
+    for attempt in range(2):  # small models sometimes break the JSON; retry once
+        resp = client.chat.completions.create(
+            model=OPENROUTER_MODEL, temperature=0, response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_POINTER},
+                {"role": "user", "content": f"Title: {r['title']}\n\n{numbered}"
+                 + ("\n\nReply with the JSON object only." if attempt else "")},
+            ],
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        if not raw:
+            raise RuntimeError("empty model reply")  # transient: leave the article for the next run
+        m = re.search(r"\{.*\}", raw, re.S)
+        try:
+            p = Pointer.model_validate_json(m.group(0) if m else raw)
+            break
+        except ValidationError:
+            if attempt:
+                raise
+    blob = f"{r['title']} {' '.join(sents)}"
+    hits = sorted({m.group(0).lower() for m in INDIA_RE.finditer(blob)})
+    india = bool(p.india_relevant and hits)
+    reason = f"Text mentions: {', '.join(hits[:4])}." if india else ""
+    impact = _pick(sents, p.impact_sentences)
+    row = [p.is_incident, india, reason, r["title"], None, p.attack_type.strip().lower()[:60], p.victim_org,
+           p.victim_country, p.victim_sector, None, False, ",".join(sorted({c.upper() for c in CVE_RE.findall(blob)})),
+           _pick(sents, p.fix_sentences), impact, impact.split(". ")[0] if impact else sents[0]]
+    return p, row
+
+
+def extract_pending(limit: int = EXTRACT_LIMIT) -> None:
     client = _client()
     conn = connect()
+    run = _run_pointer if EXTRACT_MODE == "pointer" else _run_full
     rows = conn.execute(
         """SELECT id,url,title,source,rss_summary,content_md FROM (
                SELECT *, ROW_NUMBER() OVER (PARTITION BY source ORDER BY id) AS rn FROM articles
@@ -49,20 +170,17 @@ def extract_pending(limit: int = 200) -> None:
            WHERE rn <= ? ORDER BY rn, id LIMIT ?""",
         (PER_SOURCE_PER_RUN, limit),
     ).fetchall()
+    print(f"[extract] mode={EXTRACT_MODE} model={OPENROUTER_MODEL} articles={len(rows)}")
     for r in rows:
         text = r["content_md"] or r["rss_summary"]
         try:
-            resp = client.chat.completions.create(
-                model=OPENROUTER_MODEL,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": SYSTEM},
-                    {"role": "user", "content": f"Source: {r['source']}\nTitle: {r['title']}\nURL: {r['url']}\n\n{text}"},
-                ],
-            )
-            inc = Incident.model_validate_json(resp.choices[0].message.content)
-        except Exception as ex:
+            _, values = run(client, r, text)
+        except (ValidationError, ValueError, json.JSONDecodeError) as ex:
+            print(f"[extract] SKIP {r['url']}: {str(ex)[:80]}")
+            conn.execute("UPDATE articles SET extracted=1 WHERE id=?", (r["id"],))  # bad output: do not retry forever
+            conn.commit()
+            continue
+        except Exception as ex:  # network/server problem: leave it for the next run
             print(f"[extract] ERR {r['url']}: {ex}")
             continue
         conn.execute(
@@ -70,11 +188,8 @@ def extract_pending(limit: int = 200) -> None:
                incident_date,attack_type,victim_org,victim_country,victim_sector,data_hosting_location,
                foreign_hosted_india_company,cves,fix_mitigation,consequences,supporting_snippet)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (r["id"], inc.is_incident, inc.india_relevant, inc.india_reason, inc.incident_title, inc.incident_date,
-             inc.attack_type, inc.victim_org, inc.victim_country, inc.victim_sector, inc.data_hosting_location,
-             inc.foreign_hosted_india_company, ",".join(inc.cves), inc.fix_mitigation, inc.consequences,
-             inc.supporting_snippet),
+            (r["id"], *values),
         )
         conn.execute("UPDATE articles SET extracted=1 WHERE id=?", (r["id"],))
         conn.commit()
-        print(f"[extract] {'IN ' if inc.india_relevant else '   '} {inc.attack_type or '-':<14} {r['title'][:70]}")
+        print(f"[extract] {'IN ' if values[1] else '   '} {values[5] or '-':<14} {r['title'][:70]}")

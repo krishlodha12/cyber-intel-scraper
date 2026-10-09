@@ -17,7 +17,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
@@ -34,13 +34,45 @@ jobs:
       - name: Install browser for Crawl4AI
         run: crawl4ai-setup
 
+      - name: Choose the model (paid key if you add one, otherwise a free local model)
+        id: llm
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -n "$OPENROUTER_API_KEY" ]; then
+            echo "local=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "local=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache the local model
+        if: steps.llm.outputs.local == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ollama
+          key: ollama-qwen2.5-3b-v1
+
+      - name: Start a free local model (no account, no key)
+        if: steps.llm.outputs.local == 'true'
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          nohup ollama serve > ollama.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:11434/api/tags >/dev/null && break; sleep 2; done
+          ollama pull qwen2.5:3b
+
       - name: Collect, extract, build
         env:
-          # Optional. Without a key the structured feeds still run and the site still updates.
+          FETCH_LIMIT: "40"
+          EXTRACT_LIMIT: "24"
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           LLM_BASE_URL: ${{ vars.LLM_BASE_URL || 'https://openrouter.ai/api/v1' }}
           OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || 'google/gemini-2.5-flash' }}
-        run: python main.py all
+          EXTRACT_MODE: full
+        run: |
+          if [ "${{ steps.llm.outputs.local }}" = "true" ]; then
+            export LLM_BASE_URL=http://localhost:11434/v1 LLM_API_KEY=ollama OPENROUTER_MODEL=qwen2.5:3b EXTRACT_MODE=pointer
+          fi
+          python main.py all
 
       - name: Save data back to the repo
         run: |
