@@ -95,6 +95,11 @@ jobs:
           fi
           python main.py all
 
+      - name: Send phone alerts for new India incidents
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python notify.py
+
       - name: Save data back to the repo
         run: |
           git config user.name "intel-bot"
@@ -103,7 +108,7 @@ jobs:
           git diff --cached --quiet || (git commit -m "data update [skip ci]" && git push)
 
       - name: Stage site
-        run: mkdir public && cp site/index.html public/
+        run: mkdir public && cp site/index.html site/manifest.webmanifest site/sw.js site/robots.txt site/*.png public/
 
       - uses: actions/upload-pages-artifact@v3
         with:
